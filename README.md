@@ -1,3 +1,7 @@
+# Paper Title
+
+Multi-center validation of machine learning models for predicting myopia progression across school-based screening and optical intervention settings in Chinese children and adolescents
+
 # Myoai
 
 Myoai contains two Python training scripts for tabular myopia prediction using:
