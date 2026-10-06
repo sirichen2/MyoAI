@@ -41,6 +41,30 @@ Both scripts require:
 
 The scripts will coerce numeric columns to floats. For regression labels, very large absolute values (e.g., `> 50`) are interpreted as “stored in centi-diopters” and divided by 100.
 
+### Required patient ID column
+
+Each row is one eye x one pair of consecutive visits, so one child contributes several rows
+(both eyes, multiple visits). To avoid leakage between correlated rows, both scripts split the data
+**by patient**:
+
+- internal train/test split: `GroupShuffleSplit` (no patient appears in both splits)
+- hyperparameter tuning: patient-grouped K-fold CV on the training split only
+  (`StratifiedGroupKFold` for classification, `GroupKFold` for regression; `--tune-cv`, default 5).
+  The internal test split is never used for tuning.
+- 95% CIs: cluster bootstrap that resamples whole patients (internal and, if the eval CSV has a
+  patient ID column, external).
+
+The patient ID column is `patient_id` (or `subject_id` / `person_id`), or any column passed with
+`--group-col`. It must identify the child, not the row. For example, if row IDs look like
+`<site>-<person>-<age>-<eye>`, derive it first:
+
+```python
+df["patient_id"] = df["id"].str.rsplit("-", n=2).str[0]
+```
+
+If no patient ID column exists the scripts stop with an error. `--allow-row-split` restores the
+old row-level behaviour, which lets the same child leak across splits and is not recommended.
+
 ### Optional categorical feature columns
 
 If present, these columns are used as categorical inputs:
@@ -98,6 +122,7 @@ python src/train_traditional_ml.py \
   --train-data path/to/internal.csv \
   --eval-data path/to/external.csv \
   --run-name my_run \
+  --group-col patient_id \
   --tasks all
 ```
 
@@ -107,6 +132,7 @@ python src/train_traditional_ml.py \
 python src/run_ft_transformer.py \
   --data path/to/internal.csv \
   --eval-data path/to/external.csv \
+  --group-col patient_id \
   --tasks all
 ```
 

@@ -34,7 +34,15 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import (
+    GroupKFold,
+    GroupShuffleSplit,
+    KFold,
+    StratifiedGroupKFold,
+    StratifiedKFold,
+    cross_val_score,
+    train_test_split,
+)
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.pipeline import Pipeline
@@ -80,6 +88,10 @@ REGRESSION_LABEL_CANDIDATES = [
     "label_current_se",
 ]
 
+# One row is one eye x one pair of visits, so a child contributes several rows.
+# Splits, CV folds and bootstrap resamples are done at the patient level.
+GROUP_ID_CANDIDATES = ["patient_id", "subject_id", "person_id"]
+
 YES_TOKENS = {"yes", "y", "true", "1"}
 NO_TOKENS = {"no", "n", "false", "0"}
 
@@ -89,6 +101,54 @@ def resolve_first_present_column(df: pd.DataFrame, candidates: List[str]) -> Opt
         if col in df.columns:
             return col
     return None
+
+
+def resolve_group_ids(
+    df: pd.DataFrame, group_col: Optional[str], *, required: bool, context: str
+) -> Optional[np.ndarray]:
+    col = group_col if group_col else resolve_first_present_column(df, GROUP_ID_CANDIDATES)
+    if col is None or col not in df.columns:
+        if required:
+            raise ValueError(
+                f"{context}: missing patient ID column (tried {group_col or GROUP_ID_CANDIDATES}). "
+                "Rows from the same child must stay in the same split; provide --group-col "
+                "(or pass --allow-row-split to knowingly fall back to row-level splitting)."
+            )
+        return None
+    if df[col].isna().any():
+        raise ValueError(f"{context}: patient ID column `{col}` contains missing values.")
+    return df[col].astype(str).str.strip().to_numpy()
+
+
+def patient_train_test_split(
+    n: int, groups: Optional[np.ndarray], test_size: float, seed: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    if groups is None:
+        return train_test_split(np.arange(n), test_size=test_size, random_state=seed, shuffle=True)
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    train_idx, test_idx = next(splitter.split(np.zeros(n), groups=groups))
+    overlap = set(groups[train_idx]) & set(groups[test_idx])
+    assert not overlap, f"{len(overlap)} patients appear in both train and test"
+    return np.sort(train_idx), np.sort(test_idx)
+
+
+def make_bootstrap_sampler(rng: np.random.Generator, n: int, groups: Optional[np.ndarray]):
+    """Row bootstrap if groups is None, otherwise cluster bootstrap that resamples whole patients."""
+    if groups is None:
+        return lambda: rng.integers(0, n, size=n)
+    _, inverse = np.unique(groups, return_inverse=True)
+    order = np.argsort(inverse, kind="stable")
+    counts = np.bincount(inverse)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    n_groups = len(counts)
+
+    def draw() -> np.ndarray:
+        picked = rng.integers(0, n_groups, size=n_groups)
+        lengths = counts[picked]
+        offsets = np.arange(int(lengths.sum())) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        return order[np.repeat(starts[picked], lengths) + offsets]
+
+    return draw
 
 
 def extract_binary_labels(series: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
@@ -244,11 +304,13 @@ def bootstrap_ci(
     y_prob: Optional[np.ndarray],
     metric_fn,
     n_boot: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Tuple[float, float]:
     values = []
     n = len(y_true)
+    sample = make_bootstrap_sampler(rng, n, groups)
     for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
+        idx = sample()
         yt = y_true[idx]
         yp = y_pred[idx]
         yp_prob = y_prob[idx] if y_prob is not None else None
@@ -269,6 +331,7 @@ def bootstrap_classification_cis(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     n_boot: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Tuple[float, float]]:
     if n_boot <= 0:
         return {}
@@ -290,8 +353,9 @@ def bootstrap_classification_cis(
     senss = np.full(int(n_boot), np.nan, dtype=float)
     specs = np.full(int(n_boot), np.nan, dtype=float)
 
+    sample = make_bootstrap_sampler(rng, n, groups)
     for i in range(int(n_boot)):
-        idx = rng.integers(0, n, size=n)
+        idx = sample()
         yt = y_true[idx]
         yp = y_prob[idx]
         yhat = (yp >= 0.5).astype(int)
@@ -336,6 +400,7 @@ def bootstrap_regression_cis(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     n_boot: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Tuple[float, float]]:
     if n_boot <= 0:
         return {}
@@ -353,8 +418,9 @@ def bootstrap_regression_cis(
     maes = np.full(int(n_boot), np.nan, dtype=float)
     rmses = np.full(int(n_boot), np.nan, dtype=float)
 
+    sample = make_bootstrap_sampler(rng, n, groups)
     for i in range(int(n_boot)):
-        idx = rng.integers(0, n, size=n)
+        idx = sample()
         yt = y_true[idx]
         yp = y_pred[idx]
         err = yt - yp
@@ -585,14 +651,19 @@ def is_lightgbm_model(model_name: str) -> bool:
     return normalize_model_name(model_name) == "lightgbm"
 
 
-def safe_cv_splits_classification(y: np.ndarray, requested: int) -> int:
-    pos = int(np.sum(y == 1))
-    neg = int(np.sum(y == 0))
+def safe_cv_splits_classification(y: np.ndarray, requested: int, groups: Optional[np.ndarray] = None) -> int:
+    if groups is not None:
+        pos = int(np.unique(groups[y == 1]).size)
+        neg = int(np.unique(groups[y == 0]).size)
+    else:
+        pos = int(np.sum(y == 1))
+        neg = int(np.sum(y == 0))
     return max(0, min(int(requested), pos, neg))
 
 
-def safe_cv_splits_regression(y: np.ndarray, requested: int) -> int:
-    return max(0, min(int(requested), int(len(y))))
+def safe_cv_splits_regression(y: np.ndarray, requested: int, groups: Optional[np.ndarray] = None) -> int:
+    n_units = int(np.unique(groups).size) if groups is not None else int(len(y))
+    return max(0, min(int(requested), n_units))
 
 
 def suggest_params_for_model(trial: Any, model_name: str, task_type: str) -> Dict[str, Any]:
@@ -699,23 +770,30 @@ def tune_model_optuna(
     timeout: Optional[float],
     early_stopping_rounds: int,
     max_estimators: int,
+    groups_train: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Any], float, Any]:
     if not OPTUNA_AVAILABLE:
         raise RuntimeError("Optuna is required for --tune. Install with: pip install optuna")
 
     if task_type == "classification":
-        cv_splits = safe_cv_splits_classification(y_train, cv)
+        cv_splits = safe_cv_splits_classification(y_train, cv, groups_train)
         if cv_splits < 2:
             raise RuntimeError(
                 "Not enough samples per class for StratifiedKFold: "
                 f"cv={cv}, pos={int(np.sum(y_train==1))}, neg={int(np.sum(y_train==0))}"
             )
-        splitter = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
+        if groups_train is not None:
+            splitter = StratifiedGroupKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
+        else:
+            splitter = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=seed)
     elif task_type == "regression":
-        cv_splits = safe_cv_splits_regression(y_train, cv)
+        cv_splits = safe_cv_splits_regression(y_train, cv, groups_train)
         if cv_splits < 2:
             raise RuntimeError(f"Not enough samples for KFold: cv={cv}, n={len(y_train)}")
-        splitter = KFold(n_splits=cv_splits, shuffle=True, random_state=seed)
+        if groups_train is not None:
+            splitter = GroupKFold(n_splits=cv_splits)
+        else:
+            splitter = KFold(n_splits=cv_splits, shuffle=True, random_state=seed)
     else:
         raise ValueError(f"Unknown task_type: {task_type}")
 
@@ -764,7 +842,7 @@ def tune_model_optuna(
         if use_early_stopping:
             scores: List[float] = []
             best_rounds: List[float] = []
-            split_iter = splitter.split(X_train, y_train if task_type == "classification" else None)
+            split_iter = splitter.split(X_train, y_train, groups_train)
             for fold_train_idx, fold_val_idx in split_iter:
                 X_tr = X_train.iloc[fold_train_idx]
                 y_tr = y_train[fold_train_idx]
@@ -851,6 +929,7 @@ def tune_model_optuna(
                 X_train,
                 y_train,
                 cv=splitter,
+                groups=groups_train,
                 scoring=scoring,
                 n_jobs=n_jobs,
                 error_score=np.nan,
@@ -896,6 +975,20 @@ def main() -> None:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-bootstrap", type=int, default=500)
+    parser.add_argument(
+        "--group-col",
+        type=str,
+        default=None,
+        help=(
+            "Patient ID column used for the train/test split, CV folds and cluster bootstrap "
+            f"(default: first present of {GROUP_ID_CANDIDATES})."
+        ),
+    )
+    parser.add_argument(
+        "--allow-row-split",
+        action="store_true",
+        help="Fall back to row-level splitting when no patient ID column exists (leaks between eyes/visits).",
+    )
     parser.add_argument(
         "--tasks",
         type=str,
@@ -996,12 +1089,34 @@ def main() -> None:
             df_eval[c] = df_eval[alias] if alias else UNKNOWN_CATEGORY
     X_eval, _, _ = build_feature_frame(df_eval)
 
+    groups_all = resolve_group_ids(
+        df_train, args.group_col, required=not args.allow_row_split, context="--train-data"
+    )
+    groups_eval_all = resolve_group_ids(df_eval, args.group_col, required=False, context="--eval-data")
+    if groups_all is None:
+        warnings.warn("No patient ID column: using row-level split/CV/bootstrap (same child may leak across splits).")
+    if groups_eval_all is None:
+        warnings.warn("No patient ID column in --eval-data: external CIs use row-level bootstrap.")
+
+    # Split once by patient and reuse across tasks for fairness
+    train_idx, test_idx = patient_train_test_split(len(df_train), groups_all, args.test_size, args.seed)
+
     config = {
         "train_data": str(args.train_data),
         "eval_data": str(args.eval_data),
         "test_size": args.test_size,
         "seed": args.seed,
         "n_bootstrap": args.n_bootstrap,
+        "split": {
+            "unit": "patient" if groups_all is not None else "row",
+            "group_col": args.group_col
+            or (resolve_first_present_column(df_train, GROUP_ID_CANDIDATES) if groups_all is not None else None),
+            "n_rows_train": int(len(train_idx)),
+            "n_rows_test": int(len(test_idx)),
+            "n_patients_train": int(np.unique(groups_all[train_idx]).size) if groups_all is not None else None,
+            "n_patients_test": int(np.unique(groups_all[test_idx]).size) if groups_all is not None else None,
+            "bootstrap_unit_eval": "patient" if groups_eval_all is not None else "row",
+        },
         "selected_tasks": args.tasks,
         "selected_models": args.models,
         "features": {
@@ -1035,12 +1150,6 @@ def main() -> None:
     if args.load_best_dir:
         best_params_by_task_model = load_best_params_from_dir(args.load_best_dir)
 
-    # Split once and reuse across tasks for fairness
-    indices = np.arange(len(df_train))
-    train_idx, test_idx = train_test_split(
-        indices, test_size=args.test_size, random_state=args.seed, shuffle=True
-    )
-
     X_train = X_all.iloc[train_idx]
     X_test = X_all.iloc[test_idx]
 
@@ -1068,6 +1177,9 @@ def main() -> None:
 
         X_train_task = X_train.iloc[mask_train_split]
         X_test_task = X_test.iloc[mask_test_split]
+        g_train = groups_all[train_idx][mask_train_split] if groups_all is not None else None
+        g_test = groups_all[test_idx][mask_test_split] if groups_all is not None else None
+        g_eval = groups_eval_all[mask_eval] if groups_eval_all is not None else None
 
         y_eval = y_eval_full[mask_eval]
         X_eval_task = X_eval.iloc[mask_eval]
@@ -1099,7 +1211,7 @@ def main() -> None:
                             tuning_records.append(existing)  # type: ignore[arg-type]
 
                     if cache_key not in tuned_cache:
-                        cv_used = safe_cv_splits_classification(y_train, args.tune_cv)
+                        cv_used = safe_cv_splits_classification(y_train, args.tune_cv, g_train)
                         pos = int(np.sum(y_train == 1))
                         neg = int(np.sum(y_train == 0))
                         es_rounds = (
@@ -1143,6 +1255,7 @@ def main() -> None:
                                     timeout=args.tune_timeout,
                                     early_stopping_rounds=es_rounds,
                                     max_estimators=max_est,
+                                    groups_train=g_train,
                                 )
                                 tuned_cache[cache_key] = tuned_params
 
@@ -1210,8 +1323,8 @@ def main() -> None:
 
             ci = {}
             if args.n_bootstrap > 0:
-                ci_int = bootstrap_classification_cis(rng, y_test, prob_int, args.n_bootstrap)
-                ci_ext = bootstrap_classification_cis(rng, y_eval, prob_ext, args.n_bootstrap)
+                ci_int = bootstrap_classification_cis(rng, y_test, prob_int, args.n_bootstrap, g_test)
+                ci_ext = bootstrap_classification_cis(rng, y_eval, prob_ext, args.n_bootstrap, g_eval)
                 for key in ["auc", "acc", "f1", "sens", "spec"]:
                     ci[f"{key}_int_lower"], ci[f"{key}_int_upper"] = ci_int.get(key, (math.nan, math.nan))
                     ci[f"{key}_ext_lower"], ci[f"{key}_ext_upper"] = ci_ext.get(key, (math.nan, math.nan))
@@ -1259,6 +1372,9 @@ def main() -> None:
 
         X_train_task = X_train.iloc[mask_train_split]
         X_test_task = X_test.iloc[mask_test_split]
+        g_train = groups_all[train_idx][mask_train_split] if groups_all is not None else None
+        g_test = groups_all[test_idx][mask_test_split] if groups_all is not None else None
+        g_eval = groups_eval_all[mask_eval] if groups_eval_all is not None else None
 
         y_eval = y_eval_all[mask_eval]
         X_eval_task = X_eval.iloc[mask_eval]
@@ -1293,7 +1409,7 @@ def main() -> None:
                             tuning_records.append(existing)  # type: ignore[arg-type]
 
                 if tune_this and cache_key not in tuned_cache:
-                    cv_used = safe_cv_splits_regression(y_train, args.tune_cv)
+                    cv_used = safe_cv_splits_regression(y_train, args.tune_cv, g_train)
                     n_samples = int(len(y_train))
                     es_rounds = (
                         int(args.tune_early_stopping_rounds)
@@ -1334,6 +1450,7 @@ def main() -> None:
                                 timeout=args.tune_timeout,
                                 early_stopping_rounds=es_rounds,
                                 max_estimators=max_est,
+                                groups_train=g_train,
                             )
                             tuned_cache[cache_key] = tuned_params
 
@@ -1402,8 +1519,8 @@ def main() -> None:
 
             ci = {}
             if args.n_bootstrap > 0:
-                ci_int = bootstrap_regression_cis(rng, y_test, pred_int, args.n_bootstrap)
-                ci_ext = bootstrap_regression_cis(rng, y_eval, pred_ext, args.n_bootstrap)
+                ci_int = bootstrap_regression_cis(rng, y_test, pred_int, args.n_bootstrap, g_test)
+                ci_ext = bootstrap_regression_cis(rng, y_eval, pred_ext, args.n_bootstrap, g_eval)
                 for key in ["r2", "mae", "rmse"]:
                     ci[f"{key}_int_lower"], ci[f"{key}_int_upper"] = ci_int.get(key, (math.nan, math.nan))
                     ci[f"{key}_ext_lower"], ci[f"{key}_ext_upper"] = ci_ext.get(key, (math.nan, math.nan))
