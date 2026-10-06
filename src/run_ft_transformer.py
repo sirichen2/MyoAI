@@ -23,7 +23,7 @@ from sklearn.metrics import (
     recall_score,
     confusion_matrix,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, StratifiedGroupKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -71,6 +71,9 @@ CAT_FEATURE_CANDIDATES = [
 ]
 DEFAULT_SEED = 42
 
+# Splits, tuning folds and bootstrap resamples are done at the patient level.
+GROUP_ID_CANDIDATES = ["patient_id", "subject_id", "person_id"]
+
 YES_TOKENS = {"yes", "y", "true", "1"}
 NO_TOKENS = {"no", "n", "false", "0"}
 
@@ -98,6 +101,72 @@ def apply_column_map(df: pd.DataFrame, column_map: Optional[Dict[str, str]]) -> 
     if duplicates:
         raise ValueError(f"--column-map produces duplicate target columns: {duplicates}")
     return renamed
+
+
+def resolve_group_ids(
+    df: pd.DataFrame, group_col: Optional[str], *, required: bool, context: str
+) -> Optional[np.ndarray]:
+    col = group_col
+    if not col:
+        col = next((c for c in GROUP_ID_CANDIDATES if c in df.columns), None)
+    if col is None or col not in df.columns:
+        if required:
+            raise ValueError(
+                f"{context}: missing patient ID column (tried {group_col or GROUP_ID_CANDIDATES}). "
+                "Provide --group-col (or pass --allow-row-split to split by row)."
+            )
+        return None
+    if df[col].isna().any():
+        raise ValueError(f"{context}: patient ID column `{col}` contains missing values.")
+    return df[col].astype(str).str.strip().to_numpy()
+
+
+def patient_train_test_split(
+    indices: np.ndarray,
+    groups: Optional[np.ndarray],
+    test_size: float,
+    seed: int,
+    stratify: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split `indices` so that no patient appears on both sides. `groups`/`stratify` are indexed like the full data."""
+    if groups is None:
+        return train_test_split(
+            indices,
+            test_size=test_size,
+            random_state=seed,
+            shuffle=True,
+            stratify=stratify[indices] if stratify is not None else None,
+        )
+    sub_groups = groups[indices]
+    if stratify is not None:
+        n_splits = max(2, int(round(1.0 / test_size)))
+        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        tr, te = next(splitter.split(indices, stratify[indices], sub_groups))
+    else:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        tr, te = next(splitter.split(indices, groups=sub_groups))
+    overlap = set(sub_groups[tr]) & set(sub_groups[te])
+    assert not overlap, f"{len(overlap)} patients appear in both train and test"
+    return np.sort(indices[tr]), np.sort(indices[te])
+
+
+def make_bootstrap_sampler(rng: np.random.Generator, n: int, groups: Optional[np.ndarray]):
+    """Row bootstrap if groups is None, otherwise cluster bootstrap that resamples whole patients."""
+    if groups is None:
+        return lambda: rng.integers(0, n, size=n)
+    _, inverse = np.unique(groups, return_inverse=True)
+    order = np.argsort(inverse, kind="stable")
+    counts = np.bincount(inverse)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    n_groups = len(counts)
+
+    def draw() -> np.ndarray:
+        picked = rng.integers(0, n_groups, size=n_groups)
+        lengths = counts[picked]
+        offsets = np.arange(int(lengths.sum())) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        return order[np.repeat(starts[picked], lengths) + offsets]
+
+    return draw
 
 
 def extract_binary_labels(series: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
@@ -240,6 +309,7 @@ def prepare_eval_context(
     scaler: StandardScaler,
     cat_maps: Dict[str, Dict[str, int]],
     reg_task_col: Optional[str],
+    groups: Optional[np.ndarray] = None,
 ) -> Dict:
     num_df = df[num_feature_names].copy()
     num_df = num_df.fillna(num_medians)
@@ -257,6 +327,7 @@ def prepare_eval_context(
             "num": num_data[mask],
             "cat": cat_data[mask],
             "y": y,
+            "groups": groups[mask] if groups is not None else None,
         }
 
     reg_context = None
@@ -268,6 +339,7 @@ def prepare_eval_context(
                 "num": num_data[mask],
                 "cat": cat_data[mask],
                 "y": values[mask].astype(np.float32),
+                "groups": groups[mask] if groups is not None else None,
             }
     return {
         "class": class_context,
@@ -336,12 +408,14 @@ def _bootstrap_classification_metrics(
     y_prob: np.ndarray,
     n_bootstrap: int,
     seed: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     rng = np.random.default_rng(seed)
     n = len(y_true)
+    sample = make_bootstrap_sampler(rng, n, groups)
     aucs, accs, f1s, senss, specs = [], [], [], [], []
     for _ in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
+        idx = sample()
         yt = y_true[idx]
         yp = y_prob[idx]
         yhat = (yp >= 0.5).astype(int)
@@ -379,12 +453,14 @@ def _bootstrap_regression_metrics(
     y_pred: np.ndarray,
     n_bootstrap: int,
     seed: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     rng = np.random.default_rng(seed)
     n = len(y_true)
+    sample = make_bootstrap_sampler(rng, n, groups)
     r2s, maes, rmses = [], [], []
     for _ in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
+        idx = sample()
         yt = y_true[idx]
         yp = y_pred[idx]
         try:
@@ -428,33 +504,22 @@ def train_task(
     model_name: str,
     n_bootstrap: int,
     seed: int,
+    groups: Optional[np.ndarray] = None,
 ):
     indices = np.where(mask)[0]
     if indices.size == 0:
         raise ValueError(f"No valid samples for task {task_name}.")
 
-    # Prefer a global split (same across tasks), with a fallback if it becomes degenerate.
-    train_indices = indices[global_train_mask[indices]]
-    val_indices = indices[global_test_mask[indices]]
-    if train_indices.size == 0 or val_indices.size == 0:
-        train_indices, val_indices = train_test_split(
-            indices,
-            test_size=0.2,
-            random_state=seed,
-            shuffle=True,
-        )
-    if problem_type == "classification":
-        y_train = y_values[train_indices]
-        y_val = y_values[val_indices]
-        if (np.unique(y_train).size < 2) or (np.unique(y_val).size < 2):
-            stratify = y_values[indices] if np.unique(y_values[indices]).size > 1 else None
-            train_indices, val_indices = train_test_split(
-                indices,
-                test_size=0.2,
-                random_state=seed,
-                shuffle=True,
-                stratify=stratify,
-            )
+    train_indices, val_indices = _get_task_split_indices(
+        indices=indices,
+        global_train_mask=global_train_mask,
+        global_test_mask=global_test_mask,
+        y_values=y_values,
+        problem_type=problem_type,
+        seed=seed,
+        groups=groups,
+    )
+    val_groups = groups[val_indices] if groups is not None else None
 
     train_dataset = TabDataset(num_data[train_indices], cat_data[train_indices], y_values[train_indices])
     val_dataset = TabDataset(num_data[val_indices], cat_data[val_indices], y_values[val_indices])
@@ -501,7 +566,7 @@ def train_task(
             }
         )
         if n_bootstrap > 0 and len(val_targets) > 1:
-            ci = _bootstrap_classification_metrics(val_targets.astype(int), probs, n_bootstrap, seed)
+            ci = _bootstrap_classification_metrics(val_targets.astype(int), probs, n_bootstrap, seed, val_groups)
             metrics.update(
                 {
                     "auc_int_lower": ci["auc_lower"],
@@ -550,7 +615,9 @@ def train_task(
                 }
             )
             if n_bootstrap > 0 and len(eval_targets) > 1:
-                ci = _bootstrap_classification_metrics(eval_targets.astype(int), eval_probs, n_bootstrap, seed + 1)
+                ci = _bootstrap_classification_metrics(
+                    eval_targets.astype(int), eval_probs, n_bootstrap, seed + 1, ext.get("groups")
+                )
                 metrics.update(
                     {
                         "auc_ext_lower": ci["auc_lower"],
@@ -577,7 +644,7 @@ def train_task(
         rmse = mean_squared_error(val_targets, val_preds) ** 0.5
         metrics.update({"r2_int": float(r2), "mae_int": float(mae), "rmse_int": float(rmse)})
         if n_bootstrap > 0 and len(val_targets) > 1:
-            ci = _bootstrap_regression_metrics(val_targets, val_preds, n_bootstrap, seed)
+            ci = _bootstrap_regression_metrics(val_targets, val_preds, n_bootstrap, seed, val_groups)
             metrics.update(
                 {
                     "r2_int_lower": ci["r2_lower"],
@@ -609,7 +676,7 @@ def train_task(
                 }
             )
             if n_bootstrap > 0 and len(eval_targets) > 1:
-                ci = _bootstrap_regression_metrics(eval_targets, eval_preds, n_bootstrap, seed + 1)
+                ci = _bootstrap_regression_metrics(eval_targets, eval_preds, n_bootstrap, seed + 1, ext.get("groups"))
                 metrics.update(
                     {
                         "r2_ext_lower": ci["r2_lower"],
@@ -637,28 +704,19 @@ def _get_task_split_indices(
     y_values: np.ndarray,
     problem_type: str,
     seed: int,
+    groups: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    # Prefer the global patient-level split (same across tasks), with a fallback if it becomes degenerate.
     train_indices = indices[global_train_mask[indices]]
     val_indices = indices[global_test_mask[indices]]
     if train_indices.size == 0 or val_indices.size == 0:
-        train_indices, val_indices = train_test_split(
-            indices,
-            test_size=0.2,
-            random_state=seed,
-            shuffle=True,
-        )
+        train_indices, val_indices = patient_train_test_split(indices, groups, 0.2, seed)
     if problem_type == "classification":
         y_train = y_values[train_indices]
         y_val = y_values[val_indices]
         if (np.unique(y_train).size < 2) or (np.unique(y_val).size < 2):
-            stratify = y_values[indices] if np.unique(y_values[indices]).size > 1 else None
-            train_indices, val_indices = train_test_split(
-                indices,
-                test_size=0.2,
-                random_state=seed,
-                shuffle=True,
-                stratify=stratify,
-            )
+            stratify = y_values if np.unique(y_values[indices]).size > 1 else None
+            train_indices, val_indices = patient_train_test_split(indices, groups, 0.2, seed, stratify)
     return train_indices, val_indices
 
 
@@ -679,6 +737,8 @@ def tune_ft_transformer(
     batch_size: int,
     max_samples: Optional[int],
     seed: int,
+    cv: int = 5,
+    groups: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Any], float, Any]:
     if not OPTUNA_AVAILABLE:
         raise RuntimeError("Optuna is required for --tune. Install with: pip install optuna")
@@ -687,27 +747,48 @@ def tune_ft_transformer(
     if indices.size == 0:
         raise ValueError(f"No valid samples for tuning task {task_name}.")
 
-    train_indices, val_indices = _get_task_split_indices(
-        indices=indices,
-        global_train_mask=global_train_mask,
-        global_test_mask=global_test_mask,
-        y_values=y_values,
-        problem_type=problem_type,
-        seed=seed,
-    )
+    # Tune only on the training portion; the internal test split is never seen during tuning.
+    pool = indices[global_train_mask[indices]]
+    if pool.size == 0:
+        raise ValueError(f"No training samples for tuning task {task_name}.")
+    pool_groups = groups[pool] if groups is not None else None
+    if cv < 2:
+        raise ValueError("--tune-cv must be >= 2.")
+    if problem_type == "classification":
+        if pool_groups is not None:
+            splitter = StratifiedGroupKFold(n_splits=cv, shuffle=True, random_state=seed)
+        else:
+            from sklearn.model_selection import StratifiedKFold
 
-    if max_samples is not None and int(max_samples) > 0:
-        rng = np.random.default_rng(seed)
-        max_samples_int = int(max_samples)
-        if train_indices.size > max_samples_int:
-            train_indices = rng.choice(train_indices, size=max_samples_int, replace=False)
-        if val_indices.size > max_samples_int:
-            val_indices = rng.choice(val_indices, size=max_samples_int, replace=False)
+            splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+        split_y = y_values[pool].astype(int)
+    else:
+        if pool_groups is not None:
+            splitter = GroupKFold(n_splits=cv)
+        else:
+            from sklearn.model_selection import KFold
 
-    train_dataset = TabDataset(num_data[train_indices], cat_data[train_indices], y_values[train_indices])
-    val_dataset = TabDataset(num_data[val_indices], cat_data[val_indices], y_values[val_indices])
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            splitter = KFold(n_splits=cv, shuffle=True, random_state=seed)
+        split_y = None
+
+    rng = np.random.default_rng(seed)
+    max_samples_int = int(max_samples) if max_samples is not None and int(max_samples) > 0 else None
+    fold_loaders = []
+    for fold_tr, fold_val in splitter.split(pool, split_y, pool_groups):
+        train_indices, val_indices = pool[fold_tr], pool[fold_val]
+        if max_samples_int is not None:
+            if train_indices.size > max_samples_int:
+                train_indices = rng.choice(train_indices, size=max_samples_int, replace=False)
+            if val_indices.size > max_samples_int:
+                val_indices = rng.choice(val_indices, size=max_samples_int, replace=False)
+        train_dataset = TabDataset(num_data[train_indices], cat_data[train_indices], y_values[train_indices])
+        val_dataset = TabDataset(num_data[val_indices], cat_data[val_indices], y_values[val_indices])
+        fold_loaders.append(
+            (
+                DataLoader(train_dataset, batch_size=batch_size, shuffle=True),
+                DataLoader(val_dataset, batch_size=batch_size, shuffle=False),
+            )
+        )
 
     sampler = TPESampler(seed=seed)  # type: ignore[misc]
     study = optuna.create_study(direction="maximize", sampler=sampler)  # type: ignore[union-attr]
@@ -720,27 +801,31 @@ def tune_ft_transformer(
         learning_rate = float(trial.suggest_float("learning_rate", 1e-4, 3e-3, log=True))
         weight_decay = float(trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True))
 
-        model = FTTransformer(
-            num_features=num_data.shape[1],
-            cat_cardinalities=cat_cardinalities,
-            d_token=d_token,
-            n_heads=8,
-            n_layers=4,
-            dropout=0.1,
-        ).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        criterion = nn.BCEWithLogitsLoss() if problem_type == "classification" else nn.MSELoss()
+        scores = []
+        for train_loader, val_loader in fold_loaders:
+            model = FTTransformer(
+                num_features=num_data.shape[1],
+                cat_cardinalities=cat_cardinalities,
+                d_token=d_token,
+                n_heads=8,
+                n_layers=4,
+                dropout=0.1,
+            ).to(device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            criterion = nn.BCEWithLogitsLoss() if problem_type == "classification" else nn.MSELoss()
 
-        for _ in range(int(epochs)):
-            run_epoch(model, train_loader, optimizer, criterion, device, True)
+            for _ in range(int(epochs)):
+                run_epoch(model, train_loader, optimizer, criterion, device, True)
 
-        _, val_preds, val_targets = run_epoch(model, val_loader, optimizer, criterion, device, False)
-        if problem_type == "classification":
-            probs = torch.sigmoid(torch.from_numpy(val_preds)).numpy()
-            if len(np.unique(val_targets)) < 2:
-                return -1e9
-            return float(roc_auc_score(val_targets, probs))
-        return float(r2_score(val_targets, val_preds))
+            _, val_preds, val_targets = run_epoch(model, val_loader, optimizer, criterion, device, False)
+            if problem_type == "classification":
+                probs = torch.sigmoid(torch.from_numpy(val_preds)).numpy()
+                if len(np.unique(val_targets)) < 2:
+                    return -1e9
+                scores.append(float(roc_auc_score(val_targets, probs)))
+            else:
+                scores.append(float(r2_score(val_targets, val_preds)))
+        return float(np.mean(scores))
 
     study.optimize(objective, n_trials=trials, show_progress_bar=False)  # type: ignore[union-attr]
     return dict(study.best_params), float(study.best_value), study
@@ -782,6 +867,21 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--n-bootstrap", type=int, default=200)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument(
+        "--group-col",
+        type=str,
+        default=None,
+        help=(
+            "Patient ID column used for the train/test split, tuning folds and cluster bootstrap "
+            f"(default: first present of {GROUP_ID_CANDIDATES})."
+        ),
+    )
+    parser.add_argument(
+        "--allow-row-split",
+        action="store_true",
+        help="Fall back to row-level splitting when no patient ID column exists.",
+    )
     parser.add_argument("--d-token", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -827,6 +927,12 @@ def main():
         help="Only run tuning and write tuning artifacts; skip final model training/eval.",
     )
     parser.add_argument("--tune-trials", type=int, default=30)
+    parser.add_argument(
+        "--tune-cv",
+        type=int,
+        default=5,
+        help="Patient-grouped K-fold CV on the internal training split used for tuning (test split is not used).",
+    )
     parser.add_argument("--tune-epochs", type=int, default=10)
     parser.add_argument("--tune-batch-size", type=int, default=None)
     parser.add_argument(
@@ -868,12 +974,27 @@ def main():
     for col in cat_feature_names:
         df[col] = df[col].fillna(UNKNOWN_CATEGORY).astype(str)
 
+    groups = resolve_group_ids(df, args.group_col, required=not args.allow_row_split, context="--data")
+    if groups is None:
+        print("[WARN] No patient ID column: using row-level split/bootstrap.")
+    train_idx, test_idx = patient_train_test_split(np.arange(len(df)), groups, args.test_size, args.seed)
+    global_train_mask = np.zeros(len(df), dtype=bool)
+    global_test_mask = np.zeros(len(df), dtype=bool)
+    global_train_mask[train_idx] = True
+    global_test_mask[test_idx] = True
+    if groups is not None:
+        print(
+            f"[INFO] Patient-level split: train {np.unique(groups[train_idx]).size} patients / {len(train_idx)} rows, "
+            f"test {np.unique(groups[test_idx]).size} patients / {len(test_idx)} rows"
+        )
+
     num_feature_names = [age_col, distance_col] + MEASURE_COLS
     num_df = df[num_feature_names].copy()
-    num_medians = num_df.median()
+    num_medians = num_df.iloc[train_idx].median()
     num_df = num_df.fillna(num_medians)
     scaler = StandardScaler()
-    num_data = scaler.fit_transform(num_df.values)
+    scaler.fit(num_df.values[train_idx])
+    num_data = scaler.transform(num_df.values)
     cat_data, cat_maps = encode_categories(df, cat_feature_names)
     cat_cardinalities = [len(cat_maps[feature]) for feature in cat_feature_names]
 
@@ -901,6 +1022,7 @@ def main():
             scaler,
             cat_maps,
             reg_label,
+            groups=resolve_group_ids(eval_df, args.group_col, required=False, context="--eval-data"),
         )
 
     out_dir = args.json_output.parent if args.json_output else args.model_dir.parent
@@ -909,13 +1031,6 @@ def main():
     args.model_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
-
-    indices = np.arange(len(df))
-    train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=args.seed, shuffle=True)
-    global_train_mask = np.zeros(len(df), dtype=bool)
-    global_test_mask = np.zeros(len(df), dtype=bool)
-    global_train_mask[train_idx] = True
-    global_test_mask[test_idx] = True
 
     results = []
     if args.tune:
@@ -974,6 +1089,8 @@ def main():
                 batch_size=tune_batch_size,
                 max_samples=args.tune_max_samples,
                 seed=int(args.seed),
+                cv=int(args.tune_cv),
+                groups=groups,
             )
 
             tuned_d_token = int(best_params.get("d_token", args.d_token))
@@ -1077,6 +1194,7 @@ def main():
             model_name="FT-Transformer",
             n_bootstrap=args.n_bootstrap,
             seed=args.seed,
+            groups=groups,
         )
         metrics.update({"Model": "FT-Transformer", "Split": "both"})
         results.append(metrics)
@@ -1113,6 +1231,7 @@ def main():
                 model_name="FT-Transformer",
                 n_bootstrap=args.n_bootstrap,
                 seed=args.seed,
+                groups=groups,
             )
             metrics.update({"Model": "FT-Transformer", "Split": "both"})
             results.append(metrics)
